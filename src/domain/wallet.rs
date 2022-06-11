@@ -5,13 +5,14 @@ use secp256k1::{
     PublicKey, SecretKey,
 };
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tiny_keccak::Hasher;
 use tokio::{
     fs::OpenOptions,
     io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
 };
-
 use web3::{futures::sink::Buffer, types::Address};
+use crate::encryption::Encrypter;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Wallet {
@@ -51,35 +52,37 @@ impl Wallet {
         }
     }
 
-    pub async fn save_to_file(&self, file_path: &str) -> Result<()> {
+    pub async fn save_to_file(&self, file_path: &str, secret: String) -> Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .open(file_path)
             .await?;
 
-        let serialized = serde_json::to_vec(self)?;
+        let mut serialized = serde_json::to_vec(self)?;
         //println!("{:?}", serialized);
-        file.write(&serialized).await?;
+        let encrypted = Encrypter::Encrypt(&mut serialized, secret);
+        file.write(&encrypted).await?;
 
         Ok(())
     }
 
-    pub async fn from_file(file_path: &str) -> Result<Wallet> {
+    pub async fn from_file(file_path: &str, secret: String) -> Result<Wallet> {
         let mut file = OpenOptions::new().read(true).open(file_path).await?;
 
         //TODO: BufferRead
-        let mut buffer = vec![0; 1024];
+        let mut buffer = vec![];
 
-        let count = file.read(&mut buffer).await?;
+        let count = file.read_to_end(&mut buffer).await?;
         println!("{:?}", buffer);
-        let wallet: Wallet = serde_json::from_slice(&buffer[0..count])?;
+        let decrypted = Encrypter::Decrypt(&buffer[0..count], secret)?;
+        let wallet: Wallet = serde_json::from_slice(&decrypted)?;
         Ok(wallet)
     }
 
     fn generate_keypair() -> (SecretKey, PublicKey) {
         let secp = secp256k1::Secp256k1::new();
-        let mut rng = rngs::StdRng::seed_from_u64(111);
+        let mut rng = rngs::JitterRng::new_with_timer(Wallet::get_nstime);
         secp.generate_keypair(&mut rng)
     }
 
@@ -91,6 +94,15 @@ impl Wallet {
         hasher.update(&public_key[1..]);
         hasher.finalize(&mut output);
         Address::from_slice(&output[12..])
+    }
+
+    pub fn get_nstime() -> u64 {
+        let dur = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        // The correct way to calculate the current time is
+        // `dur.as_secs() * 1_000_000_000 + dur.subsec_nanos() as u64`
+        // But this is faster, and the difference in terms of entropy is
+        // negligible (log2(10^9) == 29.9).
+        dur.as_secs() << 30 | dur.subsec_nanos() as u64
     }
 }
 
@@ -117,8 +129,9 @@ mod tests {
         );
         println!("{}", path);
 
-        wallet.save_to_file(&path).await.unwrap();
-        let wallet = Wallet::from_file(&path).await.unwrap();
+        let secret = "Secret".to_owned();
+        wallet.save_to_file(&path, secret.clone()).await.unwrap();
+        let wallet = Wallet::from_file(&path, secret.clone()).await.unwrap();
         println!("{:?}", wallet);
     }
 }
